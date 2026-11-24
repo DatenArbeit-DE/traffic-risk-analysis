@@ -1,0 +1,14 @@
+# Runtime dependencies of the Airflow-agnostic `accident_risk` package.
+# Installed in BOTH the processing container and the Airflow container so that
+# DAG tasks and standalone CLI runs execute exactly the same code.
+#
+# Ranges, not pins: the Airflow image installs these under Airflow's own
+# constraint file, which pins pandas/numpy to the versions the scheduler was
+# tested with (pandas 3.x for Airflow 3.4). The processing image resolves the
+# same majors, so both containers agree without freezing the project to one
+# pandas release forever.
+matplotlib>=3.9,<4
+numpy>=2.1,<3
+pandas>=2.2,<4
+psycopg[binary]>=3.2,<4
+pytest>=8.3,<9

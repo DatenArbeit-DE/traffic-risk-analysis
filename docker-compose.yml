@@ -1,0 +1,127 @@
+# Three containers by design:
+#   postgres   -> metadata DB for Airflow + warehouse DB for the risk model
+#   airflow    -> api-server + scheduler + dag-processor (Airflow 3 components)
+#   processing -> lightweight Python image that runs the same pipeline code
+#                 standalone (tests, backfills, debugging without Airflow)
+name: urban-traffic-accident-risk
+
+# Shared by airflow + processing: identical filesystem layout and app settings
+# so the DAG tasks and the standalone CLI are interchangeable.
+x-app-environment: &app-environment
+  TRAFFIC_DB_DSN: postgresql://${POSTGRES_USER:-traffic}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required - copy .env.example to .env}@postgres:5432/${POSTGRES_DB:-traffic}
+  PYTHONPATH: /src
+  DATA_DIR: /data
+  OUTPUTS_DIR: /outputs
+  DOCS_IMG_DIR: /docs/img
+  SQL_DIR: /sql
+  EXTRACT_SOURCE: ${EXTRACT_SOURCE:-fixture}
+  UNFALLATLAS_URLS: ${UNFALLATLAS_URLS:-}
+  PSEUDONYMIZATION_PEPPER: ${PSEUDONYMIZATION_PEPPER:?PSEUDONYMIZATION_PEPPER is required - copy .env.example to .env}
+  RAW_RETENTION_DAYS: ${RAW_RETENTION_DAYS:-90}
+  CLEAN_RETENTION_YEARS: ${CLEAN_RETENTION_YEARS:-10}
+  ANALYSIS_WINDOW_YEARS: ${ANALYSIS_WINDOW_YEARS:-}
+  MIN_SEGMENT_ACCIDENTS: ${MIN_SEGMENT_ACCIDENTS:-20}
+  TOP_SEGMENTS_HEATMAP: ${TOP_SEGMENTS_HEATMAP:-12}
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: utar-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-traffic}
+      POSTGRES_USER: ${POSTGRES_USER:-traffic}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: --data-checksums
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Only the schema bootstrap files are mounted; 03_retention.sql is
+      # executed by the application (single source of truth for purges).
+      - ./sql/00_databases.sql:/docker-entrypoint-initdb.d/00_databases.sql:ro
+      - ./sql/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./sql/02_indexes.sql:/docker-entrypoint-initdb.d/02_indexes.sql:ro
+      - ./sql/04_roles.sql:/docker-entrypoint-initdb.d/04_roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-traffic} -d ${POSTGRES_DB:-traffic}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  airflow:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    container_name: utar-airflow
+    environment:
+      <<: *app-environment
+      # --- Airflow 3 core wiring ------------------------------------------
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?AIRFLOW_FERNET_KEY is required}
+      # Airflow 3: api-server <-> scheduler authenticate with a shared JWT secret.
+      AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?AIRFLOW_JWT_SECRET is required}
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://localhost:8080/execution/
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://${POSTGRES_USER:-traffic}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+      # Connection for operator/hook users; the package itself stays
+      # Airflow-agnostic and uses TRAFFIC_DB_DSN above.
+      AIRFLOW_CONN_TRAFFIC_DB: postgresql://${POSTGRES_USER:-traffic}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-traffic}
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+      AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@example.com}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./src:/src:ro
+      - ./sql:/sql:ro
+      - ./data:/data
+      - ./outputs:/outputs
+      - ./docs/img:/docs/img
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./docker/airflow/entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://localhost:8080/ || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  processing:
+    build:
+      context: .
+      dockerfile: docker/processing/Dockerfile
+    container_name: utar-processing
+    environment:
+      <<: *app-environment
+      PYTHONDONTWRITEBYTECODE: "1"
+      # The tests are mounted at /tests (not below the workdir), so point pytest
+      # at them and at the repo's ini file: `docker compose run --rm processing
+      # pytest -q` just works, with the same markers as a local run.
+      PYTEST_ADDOPTS: "-c /app/pytest.ini /tests"
+    volumes:
+      - ./src:/src:ro
+      - ./sql:/sql:ro
+      - ./data:/data
+      - ./outputs:/outputs
+      - ./docs/img:/docs/img
+      - ./tests:/tests:ro
+      - ./pytest.ini:/app/pytest.ini:ro
+    working_dir: /app
+    # Idle by default; use `docker compose run --rm processing <cmd>`
+    command: ["sleep", "infinity"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

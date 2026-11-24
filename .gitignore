@@ -1,0 +1,28 @@
+# Secrets and local environment
+.env
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+build/
+*.egg-info/
+
+# Data zones: only the committed fixture and the label reference belong in git
+data/raw/*
+!data/raw/.gitkeep
+data/staging/*
+!data/staging/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+# Airflow runtime
+logs/
+airflow/logs/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
